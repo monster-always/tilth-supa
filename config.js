@@ -1,0 +1,13 @@
+window.SUPABASE_URL = "https://vrruipihpxgpqmcnzjsc.supabase.co";
+window.SUPABASE_ANON_KEY = "sb_publishable_IpOhtBox8Q93Z2e_0w7fbA_HMUTSZ1z";
+
+window.GROQ_API_KEYS = [
+"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",
+"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",
+"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",
+"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",
+"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",
+"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",
+"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",
+"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" 
+];
