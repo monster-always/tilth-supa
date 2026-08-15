@@ -328,44 +328,12 @@
     <p class="signup-line mono">No account? <a href="signup.html">Sign up</a></p>
   </div>
 
-  <!-- Firebase (modular v10 SDK via CDN) -->
+  <script src="config.js"></script>
+  <!-- Supabase (JS client v2 via CDN) -->
   <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-    import {
-      getAuth,
-      signInWithEmailAndPassword,
-      GoogleAuthProvider,
-      signInWithPopup,
-      sendPasswordResetEmail,
-      sendEmailVerification,
-    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-    import {
-      getFirestore,
-      doc,
-      setDoc,
-      getDoc,
-      collection,
-      query,
-      where,
-      getDocs,
-      limit,
-      serverTimestamp,
-    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-    // TODO: replace with your own Firebase project config
-    // (Firebase console -> Project settings -> General -> Your apps -> SDK setup and configuration)
-    const firebaseConfig = {
-      apiKey: "AIzaSyAQrRsdvW5fwv_3f_cv9NW255TRzg8rmts",
-      authDomain: "tilth-ai.firebaseapp.com",
-      projectId: "tilth-ai",
-      storageBucket: "tilth-ai.firebasestorage.app",
-      messagingSenderId: "631969995563",
-      appId: "1:631969995563:web:9debf13b631071746f836e",
-    };
-
-    const app = initializeApp(firebaseConfig);
-    const auth = getAuth(app);
-    const db = getFirestore(app);
+    const supabase = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
 
     const form = document.getElementById("loginForm");
     const submitBtn = document.getElementById("submitBtn");
@@ -393,59 +361,24 @@
     // Change this to your app's main page.
     const REDIRECT_URL = "profile.html";
 
-    async function ensureUserDoc(user) {
-      const userRef = doc(db, "users", user.uid);
-      const existing = await getDoc(userRef);
-      if (!existing.exists()) {
-        const username = await usernameFromGoogleProfile(user);
-        await setDoc(userRef, {
-          email: user.email,
-          username: username,
-          username_lower: username ? username.toLowerCase() : null,
-          createdAt: serverTimestamp(),
-        });
-      }
-    }
-
-    // Turns a Google display name (e.g. "Jane Doe") into a valid,
-    // available username (e.g. "jane_doe"), falling back to the email
-    // prefix if there's no display name, and appending numbers if the
-    // first choice is already taken.
-    async function usernameFromGoogleProfile(user) {
-      const source = user.displayName || (user.email ? user.email.split("@")[0] : "") || "user";
-      let base = source
-        .trim()
-        .replace(/[^a-zA-Z0-9_]+/g, "_")
-        .replace(/^_+|_+$/g, "")
-        .slice(0, 20);
-      if (base.length < 3) base = (base + "_user").slice(0, 20);
-
-      let candidate = base;
-      let usersRef = collection(db, "users");
-      for (let i = 0; i < 6; i++) {
-        const q = query(usersRef, where("username_lower", "==", candidate.toLowerCase()), limit(1));
-        const snap = await getDocs(q);
-        if (snap.empty) return candidate;
-        const suffix = String(Math.floor(Math.random() * 9000) + 100);
-        candidate = (base.slice(0, 20 - suffix.length) + suffix);
-      }
-      return candidate;
-    }
-
     // Given whatever the user typed, resolve it to an email address.
     // If it already looks like an email, use it as-is. Otherwise, treat
-    // it as a username and look up the matching email in Firestore.
+    // it as a username and look it up via the get_email_by_username
+    // Postgres function (see the SQL schema notes) rather than
+    // querying the profiles table directly, so anon visitors can
+    // resolve a login email without a broad public SELECT policy.
     async function resolveEmail(identifier) {
       if (identifier.includes("@")) {
         return identifier;
       }
-      const usersRef = collection(db, "users");
-      const q = query(usersRef, where("username_lower", "==", identifier.toLowerCase()), limit(1));
-      const snap = await getDocs(q);
-      if (snap.empty) {
+      const { data, error } = await supabase.rpc("get_email_by_username", {
+        uname: identifier.toLowerCase(),
+      });
+      if (error) {
+        console.error(error);
         return null;
       }
-      return snap.docs[0].data().email || null;
+      return data || null;
     }
 
     form.addEventListener("submit", async (e) => {
@@ -472,12 +405,17 @@
           return;
         }
 
-        const cred = await signInWithEmailAndPassword(auth, email, password);
-        await ensureUserDoc(cred.user);
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
 
-        const isPasswordAccount = cred.user.providerData.some((p) => p.providerId === "password");
-        if (isPasswordAccount && !cred.user.emailVerified) {
-          pendingUnverifiedUser = cred.user;
+        const user = data.user;
+        const isPasswordAccount = (user.identities || []).some((i) => i.provider === "email");
+
+        if (isPasswordAccount && !user.email_confirmed_at) {
+          // Supabase still returns a valid session here (unlike Firebase,
+          // which we're matching by *not* blocking the sign-in) — just
+          // nag them to verify instead of forcing it.
+          pendingUnverifiedUser = user;
           verifyBanner.style.display = "block";
           return;
         }
@@ -485,7 +423,7 @@
         window.location.href = REDIRECT_URL;
       } catch (err) {
         console.error(err);
-        showError(friendlyError(err.code));
+        showError(friendlyError(err));
       } finally {
         submitBtn.disabled = false;
         submitBtn.textContent = "Log in";
@@ -496,14 +434,17 @@
       clearError();
       verifyBanner.style.display = "none";
       pendingUnverifiedUser = null;
-      const provider = new GoogleAuthProvider();
-      try {
-        const cred = await signInWithPopup(auth, provider);
-        await ensureUserDoc(cred.user);
-        window.location.href = REDIRECT_URL;
-      } catch (err) {
-        console.error("Google sign-in error:", err.code, err.message);
-        showError(friendlyError(err.code) + " (" + err.code + ")");
+      // Supabase's Google sign-in is redirect-based (no popup): the
+      // browser leaves this page, and comes back to REDIRECT_URL with
+      // a session already established. A new profiles row is created
+      // automatically server-side (see the handle_new_user trigger).
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: window.location.origin + "/" + REDIRECT_URL },
+      });
+      if (error) {
+        console.error("Google sign-in error:", error);
+        showError(friendlyError(error));
       }
     });
 
@@ -512,7 +453,11 @@
       resendLoginBtn.disabled = true;
 
       try {
-        await sendEmailVerification(pendingUnverifiedUser);
+        const { error } = await supabase.auth.resend({
+          type: "signup",
+          email: pendingUnverifiedUser.email,
+        });
+        if (error) throw error;
         document.getElementById("verifyBannerText").textContent =
           "Verification email sent — check your inbox.";
 
@@ -530,10 +475,7 @@
         }, 1000);
       } catch (err) {
         console.error(err);
-        document.getElementById("verifyBannerText").textContent =
-          err.code === "auth/too-many-requests"
-            ? "Too many requests — try again in a bit."
-            : "Couldn't send the email. Please try again.";
+        document.getElementById("verifyBannerText").textContent = friendlyError(err);
         resendLoginBtn.disabled = false;
       }
     });
@@ -563,38 +505,44 @@
           showError("Account not created.");
           return;
         }
-        await sendPasswordResetEmail(auth, email);
+        const { error } = await supabase.auth.resetPasswordForEmail(email, {
+          redirectTo: window.location.origin + "/index.html",
+        });
+        if (error) throw error;
         showError("Password reset email sent — check your inbox.");
       } catch (err) {
         console.error(err);
-        showError(friendlyError(err.code));
+        showError(friendlyError(err));
       }
     });
 
-    function friendlyError(code) {
-      switch (code) {
-        case "auth/invalid-email":
-          return "That email address doesn't look right.";
-        case "auth/user-not-found":
-        case "auth/wrong-password":
-        case "auth/invalid-credential":
-          return "Incorrect username/email or password.";
-        case "auth/too-many-requests":
-          return "Too many attempts. Try again in a bit.";
-        case "auth/popup-closed-by-user":
-          return "Google sign-in was closed before finishing.";
-        case "auth/unauthorized-domain":
-          return "This domain isn't authorized in Firebase yet — add it under Authentication > Settings > Authorized domains.";
-        case "auth/operation-not-allowed":
-          return "Google sign-in isn't enabled yet — turn it on under Authentication > Sign-in method.";
-        case "auth/popup-blocked":
-          return "Your browser blocked the popup — allow popups for this site and try again.";
-        case "auth/api-key-not-valid.-please-pass-a-valid-api-key.":
-        case "auth/invalid-api-key":
-          return "The Firebase API key in this file isn't valid — double check it against your Firebase console.";
-        default:
-          return "Something went wrong. Please try again.";
+    // Supabase (unlike Firebase) doesn't host its own "set a new
+    // password" page — the reset link above lands back on index.html
+    // with a recovery session, and this listener catches that moment.
+    // It's a bare-bones prompt() so the flow actually works end to
+    // end; swap in a nicer inline form whenever you get to it.
+    supabase.auth.onAuthStateChange((event) => {
+      if (event === "PASSWORD_RECOVERY") {
+        const newPassword = window.prompt("Enter a new password (at least 6 characters):");
+        if (newPassword && newPassword.length >= 6) {
+          supabase.auth.updateUser({ password: newPassword }).then(({ error }) => {
+            showError(error ? friendlyError(error) : "Password updated — you can log in now.");
+          });
+        }
       }
+    });
+
+    function friendlyError(err) {
+      const msg = (err && err.message) || "";
+      const lower = msg.toLowerCase();
+      if (lower.includes("invalid login credentials")) return "Incorrect username/email or password.";
+      if (lower.includes("email not confirmed")) return "Please verify your email before logging in.";
+      if (lower.includes("rate limit") || lower.includes("too many requests")) return "Too many attempts. Try again in a bit.";
+      if (lower.includes("popup closed") || lower.includes("cancelled")) return "Google sign-in was closed before finishing.";
+      if (lower.includes("provider is not enabled") || lower.includes("unsupported provider")) return "Google sign-in isn't enabled yet — turn it on under Authentication > Providers in your Supabase project.";
+      if (lower.includes("invalid api key")) return "The Supabase anon key in config.js isn't valid — double check it against your Supabase project settings.";
+      if (lower.includes("failed to fetch")) return "Couldn't reach Supabase — check SUPABASE_URL in config.js and your connection.";
+      return msg || "Something went wrong. Please try again.";
     }
   </script>
 
