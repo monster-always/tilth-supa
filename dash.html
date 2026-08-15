@@ -4931,41 +4931,29 @@ function init() {
 init();
 </script>
 
-<!-- Firebase (modular v10 SDK via CDN) — used to pull the signed-in
+<!-- Supabase (JS client v2 via CDN) — used to pull the signed-in
      user's username for the "Hello, ___" / "Good Morning, ___" greetings -->
 <script type="module">
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-  import { getAuth, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-  import { getFirestore, doc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+  import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
   // Use the SAME config as your login, signup, and profile pages
-  const firebaseConfig = {
-    apiKey: "AIzaSyAQrRsdvW5fwv_3f_cv9NW255TRzg8rmts",
-    authDomain: "tilth-ai.firebaseapp.com",
-    projectId: "tilth-ai",
-    storageBucket: "tilth-ai.firebasestorage.app",
-    messagingSenderId: "631969995563",
-    appId: "1:631969995563:web:9debf13b631071746f836e",
-  };
+  const supabase = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
 
-  const app = initializeApp(firebaseConfig);
-  const auth = getAuth(app);
-  const db = getFirestore(app);
-
-  onAuthStateChanged(auth, async (user) => {
-    if (!user) {
-      // Nobody's logged in — send them back to the login page instead
-      // of showing the dashboard unprotected.
-      window.location.href = "index.html";
-      return;
-    }
-
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session) {
+    // Nobody's logged in — send them back to the login page instead
+    // of showing the dashboard unprotected.
+    window.location.href = "index.html";
+  } else {
     let username = "Farmer";
     try {
-      const snap = await getDoc(doc(db, "users", user.uid));
-      if (snap.exists() && snap.data().username) {
-        username = snap.data().username;
-      }
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("username")
+        .eq("id", session.user.id)
+        .maybeSingle();
+      if (error) throw error;
+      if (data && data.username) username = data.username;
     } catch (err) {
       console.error("Could not load username:", err);
     }
@@ -4978,6 +4966,10 @@ init();
     // Re-render the home view if that's what's currently showing, so the
     // "Good Morning, ___" heading picks up the real username too.
     if (state.currentView === "home") renderView("home");
+  }
+
+  supabase.auth.onAuthStateChange((event) => {
+    if (event === "SIGNED_OUT") window.location.href = "index.html";
   });
 </script>
 
