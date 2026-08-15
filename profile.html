@@ -539,41 +539,12 @@
     <button class="logout-link mono" id="logoutBtn">Log out</button>
   </div>
 
-  <!-- Firebase (modular v10 SDK via CDN) -->
+  <script src="config.js"></script>
+  <!-- Supabase (JS client v2 via CDN) -->
   <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-    import {
-      getAuth,
-      onAuthStateChanged,
-      signOut,
-      sendEmailVerification,
-    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-    import {
-      getFirestore,
-      doc,
-      getDoc,
-      setDoc,
-      collection,
-      query,
-      where,
-      getDocs,
-      limit,
-      serverTimestamp,
-    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-    // Use the SAME config as your login and signup pages
-    const firebaseConfig = {
-      apiKey: "AIzaSyAQrRsdvW5fwv_3f_cv9NW255TRzg8rmts",
-      authDomain: "tilth-ai.firebaseapp.com",
-      projectId: "tilth-ai",
-      storageBucket: "tilth-ai.firebasestorage.app",
-      messagingSenderId: "631969995563",
-      appId: "1:631969995563:web:9debf13b631071746f836e",
-    };
-
-    const app = initializeApp(firebaseConfig);
-    const auth = getAuth(app);
-    const db = getFirestore(app);
+    const supabase = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
 
     // A small pool of short farming / agtech quotes — one is picked at
     // random on each visit so the page feels a little fresh and inviting
@@ -662,13 +633,18 @@
     });
     cancelBtn.addEventListener("click", closeEdit);
 
+    // Calls the is_username_taken() Postgres function (see SQL schema
+    // notes) instead of selecting from profiles directly.
     async function isUsernameTaken(usernameLower) {
-      const usersRef = collection(db, "users");
-      const q = query(usersRef, where("username_lower", "==", usernameLower), limit(1));
-      const snap = await getDocs(q);
-      if (snap.empty) return false;
-      // Not taken if the only match is the current user's own doc.
-      return snap.docs[0].id !== currentUser.uid;
+      const { data, error } = await supabase.rpc("is_username_taken", {
+        uname: usernameLower,
+        exclude_id: currentUser.id,
+      });
+      if (error) {
+        console.error(error);
+        return false;
+      }
+      return !!data;
     }
 
     function renderIdentity(username) {
@@ -682,59 +658,80 @@
       avatarImg.alt = (username ? username : "Profile") + " picture";
     }
 
-    // If nobody's actually logged in, send them back to the login page
-    // instead of showing this page unprotected.
-    onAuthStateChanged(auth, async (user) => {
-      if (!user) {
-        window.location.href = "index.html";
-        return;
-      }
-
+    async function loadProfileForUser(user) {
       currentUser = user;
       identityEmail.textContent = user.email || "—";
 
       // Prefer the account's own photo (e.g. Google profile picture);
       // fall back to the generic avatar otherwise.
-      avatarImg.src = user.photoURL || DEFAULT_AVATAR;
+      avatarImg.src = user.user_metadata?.avatar_url || user.user_metadata?.picture || DEFAULT_AVATAR;
 
-      const userRef = doc(db, "users", user.uid);
-      const snap = await getDoc(userRef);
-      const data = snap.exists() ? snap.data() : {};
+      // The profiles row is normally created automatically by the
+      // handle_new_user trigger at signup, but this covers the rare
+      // case where it's missing (e.g. it was deleted).
+      let { data, error } = await supabase
+        .from("profiles")
+        .select("username, username_lower, created_at")
+        .eq("id", user.id)
+        .maybeSingle();
+      if (error) console.error(error);
 
-      currentUsername = data.username || "";
-      currentUsernameLower = data.username_lower || null;
-      renderIdentity(currentUsername);
-
-      if (data.createdAt && data.createdAt.toDate) {
-        const d = data.createdAt.toDate();
-        memberSince.textContent = "Member since " + d.toLocaleDateString();
-      } else {
-        memberSince.textContent = "";
+      if (!data) {
+        const insertRes = await supabase
+          .from("profiles")
+          .insert({ id: user.id, email: user.email })
+          .select("username, username_lower, created_at")
+          .maybeSingle();
+        data = insertRes.data;
       }
 
-      // Everything below comes straight off the Firebase Auth user object.
-      detailVerified.textContent = user.emailVerified ? "Yes" : "No";
-      verifiedPill.style.display = "inline-flex";
-      verifiedPill.className = "verified-pill mono " + (user.emailVerified ? "yes" : "no");
-      verifiedPill.textContent = user.emailVerified ? "Verified" : "Not verified";
+      currentUsername = data?.username || "";
+      currentUsernameLower = data?.username_lower || null;
+      renderIdentity(currentUsername);
 
-      const isPasswordAccount = user.providerData.some((p) => p.providerId === "password");
-      resendVerifyBtn.style.display = !user.emailVerified && isPasswordAccount ? "inline-block" : "none";
+      memberSince.textContent = data?.created_at
+        ? "Member since " + new Date(data.created_at).toLocaleDateString()
+        : "";
+
+      // Everything below comes straight off the Supabase Auth user object.
+      detailVerified.textContent = user.email_confirmed_at ? "Yes" : "No";
+      verifiedPill.style.display = "inline-flex";
+      verifiedPill.className = "verified-pill mono " + (user.email_confirmed_at ? "yes" : "no");
+      verifiedPill.textContent = user.email_confirmed_at ? "Verified" : "Not verified";
+
+      const identities = user.identities || [];
+      const isPasswordAccount = identities.some((i) => i.provider === "email");
+      resendVerifyBtn.style.display = !user.email_confirmed_at && isPasswordAccount ? "inline-block" : "none";
       resendStatus.style.display = "none";
 
-      const providers = user.providerData.map((p) => {
-        if (p.providerId === "password") return "Email/password";
-        if (p.providerId === "google.com") return "Google";
-        return p.providerId;
+      const providers = identities.map((i) => {
+        if (i.provider === "email") return "Email/password";
+        if (i.provider === "google") return "Google";
+        return i.provider;
       });
       detailProvider.textContent = providers.length ? providers.join(", ") : "—";
 
-      detailCreated.textContent = user.metadata.creationTime
-        ? new Date(user.metadata.creationTime).toLocaleDateString()
+      detailCreated.textContent = user.created_at
+        ? new Date(user.created_at).toLocaleDateString()
         : "—";
-      detailLastLogin.textContent = user.metadata.lastSignInTime
-        ? new Date(user.metadata.lastSignInTime).toLocaleString()
+      detailLastLogin.textContent = user.last_sign_in_at
+        ? new Date(user.last_sign_in_at).toLocaleString()
         : "—";
+    }
+
+    // If nobody's actually logged in, send them back to the login page
+    // instead of showing this page unprotected.
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) {
+      window.location.href = "index.html";
+    } else {
+      await loadProfileForUser(session.user);
+    }
+
+    supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "SIGNED_OUT") {
+        window.location.href = "index.html";
+      }
     });
 
     editForm.addEventListener("submit", async (e) => {
@@ -765,26 +762,19 @@
           }
         }
 
-        const userRef = doc(db, "users", currentUser.uid);
-        const updates = {
-          email: currentUser.email,
-          username: username,
-          username_lower: usernameLower,
-        };
-        // Only stamp createdAt the first time this doc gets a value —
-        // don't let every save reset "member since".
-        if (!currentUsernameLower && !memberSince.textContent) {
-          updates.createdAt = serverTimestamp();
-        }
-        await setDoc(userRef, updates, { merge: true });
+        const { error } = await supabase
+          .from("profiles")
+          .update({
+            email: currentUser.email,
+            username: username,
+            username_lower: usernameLower,
+          })
+          .eq("id", currentUser.id);
+        if (error) throw error;
 
         currentUsername = username;
         currentUsernameLower = usernameLower;
         renderIdentity(currentUsername);
-
-        if (!memberSince.textContent) {
-          memberSince.textContent = "Member since " + new Date().toLocaleDateString();
-        }
 
         showStatus("Saved.", "success");
         setTimeout(closeEdit, 700);
@@ -797,11 +787,10 @@
       }
     });
 
-    // In the logoutBtn click handler, replace:
     logoutBtn.addEventListener("click", async () => {
-    await signOut(auth);
-    // Redirect to thank you page instead of login
-    window.location.href = "thank.html";
+      await supabase.auth.signOut();
+      // Redirect to thank you page instead of login
+      window.location.href = "thank.html";
     });
 
     resendVerifyBtn.addEventListener("click", async () => {
@@ -811,11 +800,15 @@
       resendStatus.style.display = "block";
 
       try {
-        await sendEmailVerification(currentUser);
+        const { error } = await supabase.auth.resend({
+          type: "signup",
+          email: currentUser.email,
+        });
+        if (error) throw error;
         resendStatus.className = "resend-status mono success";
         resendStatus.textContent = "Verification email sent — check your inbox.";
 
-        // Simple cooldown so it can't be spammed; Firebase also
+        // Simple cooldown so it can't be spammed; Supabase also
         // rate-limits this server-side.
         let secondsLeft = 60;
         resendVerifyBtn.textContent = `Resend in ${secondsLeft}s`;
@@ -832,8 +825,9 @@
       } catch (err) {
         console.error(err);
         resendStatus.className = "resend-status mono error";
+        const lower = ((err && err.message) || "").toLowerCase();
         resendStatus.textContent =
-          err.code === "auth/too-many-requests"
+          lower.includes("rate limit") || lower.includes("too many")
             ? "Too many requests — try again in a bit."
             : "Couldn't send the email. Please try again.";
         resendVerifyBtn.disabled = false;
