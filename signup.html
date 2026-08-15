@@ -258,41 +258,12 @@
     <p class="login-line mono">Already have an account? <a href="index.html">Log in</a></p>
   </div>
 
-  <!-- Firebase (modular v10 SDK via CDN) -->
+  <script src="config.js"></script>
+  <!-- Supabase (JS client v2 via CDN) -->
   <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-    import {
-      getAuth,
-      createUserWithEmailAndPassword,
-      GoogleAuthProvider,
-      signInWithPopup,
-      sendEmailVerification,
-    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-    import {
-      getFirestore,
-      doc,
-      setDoc,
-      getDoc,
-      collection,
-      query,
-      where,
-      getDocs,
-      serverTimestamp,
-    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-    // TODO: use the SAME config as your login page
-    const firebaseConfig = {
-      apiKey: "AIzaSyAQrRsdvW5fwv_3f_cv9NW255TRzg8rmts",
-      authDomain: "tilth-ai.firebaseapp.com",
-      projectId: "tilth-ai",
-      storageBucket: "tilth-ai.firebasestorage.app",
-      messagingSenderId: "631969995563",
-      appId: "1:631969995563:web:9debf13b631071746f836e",
-    };
-
-    const app = initializeApp(firebaseConfig);
-    const auth = getAuth(app);
-    const db = getFirestore(app);
+    const supabase = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
 
     const form = document.getElementById("signupForm");
     const submitBtn = document.getElementById("submitBtn");
@@ -313,50 +284,16 @@
       errorMsg.textContent = "";
     }
 
-    // Looks up the "users" collection for an existing username (case-insensitive).
+    // Calls the is_username_taken() Postgres function instead of
+    // selecting straight from profiles, so anon visitors can check
+    // availability without a broad public SELECT policy.
     async function isUsernameTaken(usernameLower) {
-      const usersRef = collection(db, "users");
-      const q = query(usersRef, where("username_lower", "==", usernameLower));
-      const snap = await getDocs(q);
-      return !snap.empty;
-    }
-
-    async function createUserDoc(user, username) {
-      const userRef = doc(db, "users", user.uid);
-      const existing = await getDoc(userRef);
-      if (!existing.exists()) {
-        await setDoc(userRef, {
-          email: user.email,
-          username: username || null,
-          username_lower: username ? username.toLowerCase() : null,
-          createdAt: serverTimestamp(),
-        });
+      const { data, error } = await supabase.rpc("is_username_taken", { uname: usernameLower });
+      if (error) {
+        console.error(error);
+        return false; // fail open on the client — the DB unique index is the real guard
       }
-    }
-
-    // Turns a Google display name (e.g. "Jane Doe") into a valid,
-    // available username (e.g. "jane_doe"), falling back to the email
-    // prefix if there's no display name, and appending numbers if the
-    // first choice is already taken.
-    async function usernameFromGoogleProfile(user) {
-      const source = user.displayName || (user.email ? user.email.split("@")[0] : "") || "user";
-      let base = source
-        .trim()
-        .replace(/[^a-zA-Z0-9_]+/g, "_")
-        .replace(/^_+|_+$/g, "")
-        .slice(0, 20);
-      if (base.length < 3) base = (base + "_user").slice(0, 20);
-
-      let candidate = base;
-      const usersRef = collection(db, "users");
-      for (let i = 0; i < 6; i++) {
-        const q = query(usersRef, where("username_lower", "==", candidate.toLowerCase()), limit(1));
-        const snap = await getDocs(q);
-        if (snap.empty) return candidate;
-        const suffix = String(Math.floor(Math.random() * 9000) + 100);
-        candidate = (base.slice(0, 20 - suffix.length) + suffix);
-      }
-      return candidate;
+      return !!data;
     }
 
     form.addEventListener("submit", async (e) => {
@@ -387,26 +324,37 @@
         const taken = await isUsernameTaken(username.toLowerCase());
         if (taken) {
           showError("That username is already taken.");
-          submitBtn.disabled = false;
-          submitBtn.textContent = "Create account";
           return;
         }
 
-        const cred = await createUserWithEmailAndPassword(auth, email, password);
-        await createUserDoc(cred.user, username);
+        // The username goes into user_metadata here; a database
+        // trigger (handle_new_user, see the SQL schema notes) reads
+        // it and creates the matching profiles row server-side —
+        // that way it exists even before the user confirms their
+        // email. Supabase also sends the confirmation email itself,
+        // so there's no separate "send verification" call needed.
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: {
+            data: { username },
+            emailRedirectTo: window.location.origin + "/index.html",
+          },
+        });
+        if (error) throw error;
 
-        // Google accounts arrive already verified — this path is only
-        // for email/password signups, so fire off the verification email.
-        try {
-          await sendEmailVerification(cred.user);
-        } catch (verifyErr) {
-          console.error("Could not send verification email:", verifyErr);
+        if (data.session) {
+          // Email confirmation is off for this project — the user is
+          // signed in immediately.
+          window.location.href = REDIRECT_URL;
+        } else {
+          // Default Supabase behavior: no session until they confirm.
+          showError("Account created — check your email to verify, then log in.");
+          setTimeout(() => { window.location.href = "index.html"; }, 2500);
         }
-
-        window.location.href = REDIRECT_URL;
       } catch (err) {
         console.error(err);
-        showError(friendlyError(err.code));
+        showError(friendlyError(err));
       } finally {
         submitBtn.disabled = false;
         submitBtn.textContent = "Create account";
@@ -415,18 +363,16 @@
 
     googleBtn.addEventListener("click", async () => {
       clearError();
-      const provider = new GoogleAuthProvider();
-      try {
-        const cred = await signInWithPopup(auth, provider);
-        // Derive a username from the Google account's display name
-        // (e.g. "Jane Doe" -> "jane_doe"), falling back to the email
-        // prefix, and de-duping if it's already taken.
-        const username = await usernameFromGoogleProfile(cred.user);
-        await createUserDoc(cred.user, username);
-        window.location.href = REDIRECT_URL;
-      } catch (err) {
-        console.error("Google sign-in error:", err.code, err.message);
-        showError(friendlyError(err.code) + " (" + err.code + ")");
+      // Redirect-based like the login page's Google button — a
+      // profiles row is created automatically by the same trigger,
+      // with a username derived from the Google profile.
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: window.location.origin + "/" + REDIRECT_URL },
+      });
+      if (error) {
+        console.error("Google sign-in error:", error);
+        showError(friendlyError(error));
       }
     });
 
@@ -437,25 +383,17 @@
       togglePassword.setAttribute("aria-label", isShowing ? "Show password" : "Hide password");
     });
 
-    function friendlyError(code) {
-      switch (code) {
-        case "auth/email-already-in-use":
-          return "An account already exists with that email.";
-        case "auth/invalid-email":
-          return "That email address doesn't look right.";
-        case "auth/weak-password":
-          return "Password is too weak — use at least 6 characters.";
-        case "auth/popup-closed-by-user":
-          return "Google sign-in was closed before finishing.";
-        case "auth/unauthorized-domain":
-          return "This domain isn't authorized in Firebase yet — add it under Authentication > Settings > Authorized domains.";
-        case "auth/operation-not-allowed":
-          return "Google sign-in isn't enabled yet — turn it on under Authentication > Sign-in method.";
-        case "auth/popup-blocked":
-          return "Your browser blocked the popup — allow popups for this site and try again.";
-        default:
-          return "Something went wrong. Please try again.";
-      }
+    function friendlyError(err) {
+      const msg = (err && err.message) || "";
+      const lower = msg.toLowerCase();
+      if (lower.includes("already registered") || lower.includes("already exists")) return "An account already exists with that email.";
+      if (lower.includes("invalid email")) return "That email address doesn't look right.";
+      if (lower.includes("password") && (lower.includes("weak") || lower.includes("at least") || lower.includes("should be"))) return "Password is too weak — use at least 6 characters.";
+      if (lower.includes("popup closed") || lower.includes("cancelled")) return "Google sign-in was closed before finishing.";
+      if (lower.includes("provider is not enabled") || lower.includes("unsupported provider")) return "Google sign-in isn't enabled yet — turn it on under Authentication > Providers in your Supabase project.";
+      if (lower.includes("invalid api key")) return "The Supabase anon key in config.js isn't valid — double check it against your Supabase project settings.";
+      if (lower.includes("failed to fetch")) return "Couldn't reach Supabase — check SUPABASE_URL in config.js and your connection.";
+      return msg || "Something went wrong. Please try again.";
     }
   </script>
 
