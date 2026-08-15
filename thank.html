@@ -244,32 +244,13 @@
 
 </div>
 
-<!-- Firebase (modular v10 SDK via CDN) -->
+<script src="config.js"></script>
+<!-- Supabase (JS client v2 via CDN) -->
 <script type="module">
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-  import { 
-    getFirestore, 
-    collection, 
-    addDoc, 
-    serverTimestamp,
-    getDocs,
-    query,
-    orderBy,
-    limit
-  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+  import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
   // Use the SAME config as your login and signup pages
-  const firebaseConfig = {
-    apiKey: "AIzaSyAQrRsdvW5fwv_3f_cv9NW255TRzg8rmts",
-    authDomain: "tilth-ai.firebaseapp.com",
-    projectId: "tilth-ai",
-    storageBucket: "tilth-ai.firebasestorage.app",
-    messagingSenderId: "631969995563",
-    appId: "1:631969995563:web:9debf13b631071746f836e",
-  };
-
-  const app = initializeApp(firebaseConfig);
-  const db = getFirestore(app);
+  const supabase = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
 
   // ============================================================
   // Star rating
@@ -309,7 +290,7 @@
   }
 
   // ============================================================
-  // Submit feedback to Firestore
+  // Submit feedback to Supabase
   // ============================================================
   const feedbackText = document.getElementById('feedbackText');
   const submitBtn = document.getElementById('submitFeedbackBtn');
@@ -333,24 +314,26 @@
     clearStatus();
 
     try {
-      // Store feedback in Firestore "feedback" collection
-      const docRef = await addDoc(collection(db, "feedback"), {
-        rating: rating,
-        comment: comment || '',
-        createdAt: serverTimestamp(),
-        source: 'logout_page',
-        // Include browser info for debugging
-        userAgent: navigator.userAgent || '',
-        // Optional: get user email from localStorage if available
-        // userEmail: localStorage.getItem('userEmail') || null,
-      });
+      // Store feedback in the "feedback" table (public insert, see SQL
+      // schema notes).
+      const { data, error } = await supabase
+        .from("feedback")
+        .insert({
+          rating: rating,
+          comment: comment || '',
+          source: 'logout_page',
+          user_agent: navigator.userAgent || '',
+        })
+        .select("id")
+        .single();
+      if (error) throw error;
 
-      console.log('Feedback saved with ID:', docRef.id);
-      
+      console.log('Feedback saved with ID:', data.id);
+
       showStatus('Thank you! Your feedback helps us grow. 🌱', 'success');
       submitBtn.textContent = '✓ Sent';
       submitBtn.disabled = true;
-      
+
       // Reset button after 3 seconds
       setTimeout(() => {
         submitBtn.textContent = 'Submit Feedback';
@@ -382,26 +365,12 @@
   });
 
   // ============================================================
-  // (Optional) Test: Check if feedback collection exists
-  // ============================================================
-  async function checkFeedbackCollection() {
-    try {
-      const q = query(collection(db, "feedback"), orderBy("createdAt", "desc"), limit(1));
-      const snapshot = await getDocs(q);
-      console.log('Feedback collection exists. Total documents:', snapshot.size);
-    } catch (err) {
-      console.warn('Feedback collection not accessible yet:', err);
-    }
-  }
-  
-  // Uncomment to test if Firestore is working
-  // checkFeedbackCollection();
-
-  // ============================================================
   // Redirect after 15 seconds if user does nothing
   // ============================================================
   let redirectTimer = setTimeout(() => {
-    window.location.href = 'login.html';
+    // NOTE: this used to point at "login.html", which doesn't exist
+    // in this project — fixed to match the actual login page.
+    window.location.href = 'index.html';
   }, 15000);
 
   // Cancel redirect if user interacts
